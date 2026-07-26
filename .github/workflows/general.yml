@@ -4,7 +4,6 @@ on: [push, pull_request]
 
 env:
   CARGO_TERM_COLOR: always
-  SQLX_OFFLINE: true
 
 jobs:
   test:
@@ -24,6 +23,8 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5432/newsletter
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -31,7 +32,6 @@ jobs:
         run: cargo install sqlx-cli --no-default-features --features rustls,postgres
       - name: Run migrations
         run: |
-          export DATABASE_URL=postgres://postgres:password@localhost:5432/newsletter
           sqlx database create
           sqlx migrate run
       - run: cargo test --all-features
@@ -49,6 +49,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: true
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
