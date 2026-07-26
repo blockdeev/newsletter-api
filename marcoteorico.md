@@ -699,6 +699,116 @@ Ya vimos la diferencia teórica (sección 15 del capítulo anterior tocaba `Exec
 
 ---
 
+# 📊 Capítulo 4 — Telemetría y Observabilidad
+
+## 2️⃣2️⃣ ¿Por qué instrumentar el código? 🔍
+
+### El problema: "unknown unknowns"
+
+Una vez que una aplicación corre en producción, van a aparecer fallas que **ni siquiera imaginaste al diseñarla** — no vas a estar mirando la pantalla en el momento exacto en que algo se rompa, y muchas veces no es práctico (ni posible) conectar un debugger a un proceso corriendo en un servidor remoto.
+
+La única herramienta real para investigar esos casos después de que ocurrieron es la **telemetría**: información sobre la ejecución de la aplicación, recolectada automáticamente, que se puede inspeccionar más tarde.
+
+### Qué significa "instrumentar"
+
+**Instrumentar** = agregarle al código la capacidad de **reportar qué está haciendo mientras se ejecuta** — el equivalente a ponerle sensores a una máquina, en vez de confiar en que "funciona porque sí".
+
+> 💡 Metáfora: un avión tiene instrumentos (altímetro, velocímetro) que informan constantemente su estado interno. Sin ellos, el piloto solo sabría "vuela o no vuela" — nada sobre *cómo* está volando. Tu código sin instrumentar es igual: sabés que devolvió `200` o `500`, pero no tenés idea de qué pasó en el medio.
+
+Cualquier cosa que reporte información sobre la ejecución cuenta como instrumentación: un span que mide cuánto tardó una operación, o un evento puntual (`tracing::error!`) que registra que algo salió mal.
+
+---
+
+## 2️⃣3️⃣ De `log` a `tracing`: por qué los logs sueltos no alcanzan 🪵
+
+### El problema con logs tradicionales (`log`)
+
+Cada log de la librería `log` es un **evento aislado en el tiempo** — una línea suelta, sin relación con las demás. Con requests concurrentes, los logs de distintos requests se intercalan en la terminal sin ningún orden claro:
+
+```
+[INFO] Adding 'thomas@mail.com' as a new subscriber
+[INFO] Adding 's_erikson@mail.io' as a new subscriber
+[ERROR] Failed to execute query: connection error
+```
+
+¿A cuál de los dos suscriptores corresponde el error? Imposible saberlo sin agregar manualmente un identificador a cada log, a mano, en cada función — algo que no escala.
+
+### La solución: el concepto de *span*
+
+A diferencia de un log (un punto en el tiempo), un **span representa una unidad de trabajo con inicio y fin**, que puede contener otros spans anidados adentro. Los datos que le adjuntás a un span (un `request_id`, un email) quedan disponibles automáticamente para todo lo que pase "dentro" de él — no hace falta volver a pasarlos como parámetro en cada función.
+
+---
+
+## 2️⃣4️⃣ ¿Qué es un `Span`, exactamente? ⏱️
+
+Un `Span` es un **struct concreto** (del crate `tracing`) — no es solo una idea abstracta. Cuando escribís `tracing::info_span!(...)` o usás la macro `#[tracing::instrument]`, en algún punto se construye una instancia real de ese tipo.
+
+Cumple **tres funciones combinadas**:
+
+### 1. Cronómetro
+Mide cuánto tardó una unidad de trabajo, desde que se creó hasta que se cerró. Es dato duro y medible — en los logs reales del proyecto aparece como el campo `elapsed_milliseconds`.
+
+### 2. Nodo en un árbol de causalidad
+Un span puede contener spans hijos, y esa estructura padre-hijo permite reconstruir **qué llamó a qué, y en qué orden**:
+
+```
+HTTP REQUEST (200ms total)
+  └── Adding a new subscriber (180ms)
+        └── Saving new subscriber details in the database (150ms)
+```
+
+Con ese árbol, un sistema de observabilidad puede mostrar exactamente qué porción del tiempo total se la comió cada sub-tarea — sin él, solo se conoce el tiempo total, sin saber en qué se fue.
+
+### 3. Contenedor de contexto y eventos
+Cualquier dato adjuntado a un span (el `request_id`, el email del suscriptor) queda disponible para sus hijos automáticamente. Y cualquier log emitido mientras el span está activo queda **correlacionado** a él — no flota suelto, sin relación a nada.
+
+> ✅ En conjunto, esto es lo que permite pasar de *"este request tardó 200ms"* a *"y 150 de esos milisegundos fueron específicamente el insert a la base de datos"* — sin esa estructura, solo hay un total, sin visibilidad de dónde se fue el tiempo.
+
+---
+
+## 2️⃣5️⃣ ¿Qué es un `Subscriber`? 🗄️
+
+Los spans y los eventos son solo **cosas que van pasando** — se abre un span, se cierra, ocurre un evento. Algo tiene que **decidir qué hacer con toda esa información**: ¿la descarta? ¿la imprime en la terminal? ¿la manda a un sistema externo?
+
+Eso es exactamente lo que hace un **Subscriber**: recibe y procesa cada uno de esos eventos. Concretamente, es un tipo que se configura una sola vez y se registra como el único encargado de procesar todo, en todo el programa (`init_subscriber`, en este proyecto).
+
+> ⚠️ Si nunca se instala un subscriber, los spans/eventos igual "existen" en tiempo de ejecución, pero nadie los registra en ningún lado — se pierden, como una oficina que genera trámites pero nunca contrató a nadie para archivarlos.
+
+### Cómo se arma en este proyecto (`src/telemetry.rs`)
+
+- **`get_subscriber(name, env_filter, sink)`** — arma la configuración (nombre del servicio, nivel de detalle según `RUST_LOG`, y hacia dónde van los logs: la terminal, o a la nada en tests silenciosos).
+- **`init_subscriber(subscriber)`** — lo activa como el subscriber global, una sola vez, al arrancar el programa (o cada test).
+
+### Por qué `static ... LazyLock` en los tests
+
+```rust
+static TRACING: LazyLock<()> = LazyLock::new(|| { /* ... */ });
+```
+
+Como solo puede haber **un** subscriber activo por programa, y hay muchos tests que llaman a `spawn_app()`, se necesita garantizar que la inicialización ocurra **una sola vez**, sin importar cuántos tests corran. `LazyLock` (parte de `std` desde Rust 1.80, reemplaza a `once_cell::sync::Lazy`) resuelve justo eso: la primera vez que se lo "fuerza" (`LazyLock::force`), ejecuta la inicialización; todas las veces siguientes, la saltea.
+
+---
+
+## 2️⃣6️⃣ Misma infraestructura en desarrollo, test y producción 🏗️
+
+Un punto importante: la instrumentación armada acá (`tracing`, spans, el subscriber) **no es una versión simplificada para practicar** — son los mismos crates y macros que van a correr, tal cual, en un servidor de producción el día del deploy.
+
+### Por qué instrumentar también los tests, no solo la app
+
+> Si no se puede debuggear una falla a partir de los logs durante un test que falla en la propia máquina, va a ser todavía más difícil debuggear ese mismo problema en producción — sin poder reproducirlo a voluntad, y sin poder adjuntar un debugger.
+
+Los tests son el entorno más barato y controlado para confirmar que la instrumentación realmente sirve, antes de que importe de verdad.
+
+### `request_id` consistente de punta a punta
+
+El middleware `TracingLogger` (de `tracing-actix-web`) genera un span raíz con un `request_id` único por cada request HTTP entrante. Mientras el handler no genere su *propio* `request_id` por separado (un error fácil de cometer, señalado explícitamente en el libro), todos los spans/logs de ese request — incluyendo los de sub-funciones como `insert_subscriber` — heredan el mismo ID, permitiendo reconstruir la historia completa de un request específico buscando por ese único identificador.
+
+### Qué cambia al desplegar
+
+Nada de la generación de logs se reescribe. Lo único que cambiaría es el **destino**: en vez de imprimir el JSON en una terminal local, se apuntaría a un servicio de logging remoto (ElasticSearch, o similar) — la instrumentación en sí ya queda resuelta.
+
+---
+
 ## ✅ Resumen ejecutivo
 
 | Concepto | Rol |
@@ -721,9 +831,15 @@ Ya vimos la diferencia teórica (sección 15 del capítulo anterior tocaba `Exec
 | **Workers de Actix** | Un proceso por núcleo de la máquina, cada uno con su propia copia de `App`, construida invocando el mismo closure |
 | **`web::Data` + `Arc` + type-map** | Envuelve un recurso no clonable en un `Arc` (siempre clonable); Actix lo recupera vía `TypeId` en un `HashMap` interno — un patrón similar a "dependency injection" |
 | **`PgConnection` vs. `PgPool`** | Conexión única para tareas administrativas puntuales (crear una DB); pool para todo lo que requiera concurrencia real |
+| **Instrumentar código** | Darle a la aplicación la capacidad de reportar qué está haciendo mientras corre — indispensable para debuggear sin acceso en vivo al proceso |
+| **`Span`** | Struct concreto de `tracing`: cronómetro de una unidad de trabajo, nodo en un árbol de causalidad, y contenedor de contexto/eventos correlacionados |
+| **`Subscriber`** | Tipo que recibe y procesa spans/eventos (filtra, formatea, decide destino); sin uno registrado, los eventos se pierden |
+| **`LazyLock`** | Garantiza que la inicialización del subscriber ocurra una sola vez, sin importar cuántos tests la invoquen |
+| **`request_id` vía `TracingLogger`** | Identificador único por request HTTP, heredado por todos los spans/logs internos — permite correlacionar toda la historia de un request puntual |
+| **Telemetría dev/test = telemetría en producción** | Los mismos crates y macros instrumentados en desarrollo son los que corren en producción; solo cambia el destino final de los logs |
 
 ---
 
 ## 📖 Fuente
 
-Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 completo (Sign Up A New Subscriber: extractors, HTML forms, `sqlx`, `PgPool`, aislamiento de tests), contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9), `config`, `uuid` y `chrono`.
+Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 (Sign Up A New Subscriber) y 4 (Telemetry) completos, contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9), `config`, `uuid`, `chrono`, `tracing` y `secrecy` (0.10, con `SecretBox`/`SecretString` reemplazando al `Secret<T>` del libro original).

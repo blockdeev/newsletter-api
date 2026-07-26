@@ -73,13 +73,15 @@ zero2prod/
 ├── src/
 │   ├── lib.rs              ← declara los módulos públicos de la librería
 │   ├── main.rs              ← entrypoint mínimo: lee config, arma TcpListener + PgPool, arranca el server
-│   ├── startup.rs           ← arma App/HttpServer, registra rutas y estado compartido (PgPool)
+│   ├── startup.rs           ← arma App/HttpServer, registra rutas, middlewares y estado compartido (PgPool)
 │   ├── configuration.rs     ← lee configuration.yaml y expone los Settings tipados
+│   ├── telemetry.rs         ← configura y activa el stack de logging estructurado (tracing)
 │   └── routes/
 │       ├── mod.rs           ← re-exporta los handlers de cada archivo de ruta
 │       ├── health_check.rs  ← handler GET /health_check
 │       └── subscriptions.rs ← handler POST /subscriptions
 ├── migrations/               ← migraciones SQL versionadas (generadas con sqlx-cli)
+├── .sqlx/                    ← caché de metadata de queries, para compilar sin conexión a la DB (CI)
 ├── scripts/
 │   └── init_db.sh            ← levanta Postgres en Docker y corre las migraciones
 ├── tests/
@@ -90,7 +92,7 @@ zero2prod/
 
 ¿Por qué separado así? Porque un binario (`main.rs`) no se puede importar como dependencia desde otro archivo. Al mover la lógica a `lib.rs` y sus módulos, los tests en `tests/` pueden hacer `use zero2prod::startup::run` y levantar el servidor real para probarlo end-to-end, tal como lo haría un cliente HTTP externo.
 
-📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`, HTML forms, migraciones, `Application State`, workers de Actix, `PgPool` vs `PgConnection`), ver [`marcoteorico.md`](./marcoteorico.md).
+📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`, HTML forms, migraciones, `Application State`, workers de Actix, `PgPool` vs `PgConnection`, spans y subscribers de `tracing`), ver [`marcoteorico.md`](./marcoteorico.md).
 
 ---
 
@@ -118,6 +120,38 @@ Puntos clave de cómo están armados:
 - Cada test crea su **propia base de datos**, con un nombre aleatorio (`uuid`), y corre las migraciones sobre ella antes de arrancar el servidor. Esto aísla los tests entre sí — evita que datos guardados por un test (o una corrida anterior) interfieran con otro. Requiere que Postgres esté corriendo (ver sección de base de datos más abajo).
 
 > ⚠️ Las bases de datos de test no se eliminan automáticamente después de cada corrida (es intencional — Postgres es solo para desarrollo/test). Si se acumulan demasiadas, alcanza con reiniciar el contenedor Docker.
+
+---
+
+## 📊 Telemetría y logging estructurado
+
+La aplicación emite logs estructurados en formato **JSON**, con soporte para trazar cada request de punta a punta.
+
+### Configuración
+
+Todo el stack de logging se arma en `src/telemetry.rs` (`get_subscriber` + `init_subscriber`), y se activa una sola vez, tanto en `main.rs` como en `tests/health_check.rs`.
+
+### Controlar el nivel de detalle
+
+```bash
+RUST_LOG=debug cargo run
+```
+
+Por defecto, si no se setea `RUST_LOG`, se usa el nivel `info`.
+
+### Ver logs durante un test específico
+
+Por defecto, los tests corren en silencio (los logs van a `std::io::sink`). Para verlos:
+
+```bash
+TEST_LOG=true cargo test health_check_works -- --nocapture
+```
+
+### Cada request queda correlacionado con un `request_id`
+
+Gracias al middleware `TracingLogger` (de `tracing-actix-web`), todos los logs generados durante el procesamiento de un mismo request HTTP —incluyendo los que emite la lógica de negocio internamente— comparten el mismo `request_id`. Esto permite reconstruir la historia completa de un request puntual (qué datos llegaron, qué falló, qué se devolvió) buscando por ese único identificador.
+
+📖 Qué es un *span*, qué es un *subscriber*, y por qué la instrumentación de desarrollo/test es la misma que corre en producción: ver [`marcoteorico.md`](./marcoteorico.md).
 
 ---
 
@@ -180,6 +214,12 @@ PGPASSWORD=password psql -h localhost -U postgres -p 5432 -d newsletter -c '\dt'
 | `config` | Lee `configuration.yaml` y lo convierte en structs tipados (`Settings`) |
 | `uuid` (feature `v4`) | Genera identificadores únicos (`id` de cada suscriptor) |
 | `chrono` | Maneja timestamps (`subscribed_at`) |
+| `tracing` | Instrumentación: macros y el concepto de `Span` para representar unidades de trabajo |
+| `tracing-subscriber` (`registry`, `env-filter`) | Arma el pipeline que procesa los spans/eventos y filtra por nivel (`RUST_LOG`) |
+| `tracing-bunyan-formatter` | Formatea los logs como JSON estructurado |
+| `tracing-log` | Redirige logs de dependencias que usan `log` (como `actix-web`) hacia el mismo pipeline de `tracing` |
+| `tracing-actix-web` | Middleware `TracingLogger`: genera un `request_id` consistente por cada request HTTP |
+| `secrecy` (feature `serde`) | Envuelve el password de la base de datos (`SecretString`) para que no se filtre en logs por accidente |
 
 📖 El porqué de elegir una base de datos relacional, por qué Postgres puntualmente, y por qué `sqlx` sobre otras alternativas del ecosistema Rust, están explicados en [`marcoteorico.md`](./marcoteorico.md).
 
@@ -202,11 +242,21 @@ Este repo corre chequeos automáticos en cada `push` y `pull request`, usando Gi
 
 ### `general.yml`
 
-Corre tres jobs en paralelo:
+Corre tres jobs:
 
-- **Test** → corre la suite de tests (`cargo test`), incluyendo los tests de integración.
-- **Rustfmt** → verifica que el código esté formateado según el estándar de Rust (`cargo fmt --check`).
-- **Clippy** → corre el linter oficial de Rust, que detecta errores comunes y malas prácticas (`cargo clippy`).
+- **Test** → corre la suite de tests (`cargo test --all-features`) contra un **Postgres real**, levantado como *service container* dentro del propio job. Antes de testear, instala `sqlx-cli` y corre las migraciones.
+- **Rustfmt** → verifica que el código esté formateado según el estándar de Rust (`cargo fmt --check`). No compila nada, así que no necesita base de datos.
+- **Clippy** → corre el linter oficial de Rust (`cargo clippy`), usando `SQLX_OFFLINE=true`. En vez de conectarse a una base de datos real para validar las queries de `sqlx::query!`, usa el caché de metadata guardado en `.sqlx/`.
+
+> ⚠️ **Sobre el caché `.sqlx/`**: cada vez que se agregue o modifique una query con `sqlx::query!`/`sqlx::query!` en `src/`, hay que regenerar el caché (con Postgres corriendo localmente):
+> ```bash
+> export DATABASE_URL="postgres://postgres:password@localhost:5432/newsletter"
+> cargo sqlx prepare
+> git add .sqlx/
+> ```
+> Si no se regenera, el job de `clippy` va a fallar con *"there is no cached data for this query"*.
+>
+> El job `test` **no** usa el caché — corre contra una base de datos real, así que siempre valida las queries de forma genuina, incluidas las que viven en `tests/` (que `cargo sqlx prepare` no escanea).
 
 ### `audit.yml`
 
