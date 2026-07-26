@@ -12,9 +12,17 @@ name = "zero2prod"
 
 [dependencies]
 actix-web = "4.14.0"
+chrono = "0.4.45"
 config = "0.15.25"
+secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "macros", "postgres", "uuid", "chrono", "migrate"] }
+tracing = "0.1.44"
+tracing-actix-web = "0.7.22"
+tracing-bunyan-formatter = "0.3.10"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["registry", "env-filter"] }
+uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
