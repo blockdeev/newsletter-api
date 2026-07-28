@@ -809,6 +809,117 @@ Nada de la generación de logs se reescribe. Lo único que cambiaría es el **de
 
 ---
 
+# 🐳 Capítulo 5 — Going Live: Docker y Despliegue
+
+## 2️⃣7️⃣ Por qué desplegar temprano, no al final 🚀
+
+Es tentador pensar en el despliegue como el último paso, cuando "ya está todo terminado". El libro plantea lo contrario: en desarrollo *trunk-based*, la rama principal debería poder desplegarse en cualquier momento, aunque tenga pocas features.
+
+### Por qué conviene
+
+- **Detecta problemas de infraestructura temprano**, cuando el proyecto es chico y fácil de debuggear — no después de meses de desarrollo, con una arquitectura ya compleja.
+- Es la continuación natural del CI: automatizar tests/lint/audit da feedback rápido sobre *"¿el código está bien escrito?"*; desplegar temprano da feedback sobre *"¿esto funciona en un entorno real, no solo en mi máquina?"*.
+- A partir de ahí, cada feature nueva se despliega de forma incremental — no hay un "gran deploy final".
+
+---
+
+## 2️⃣8️⃣ Qué es Docker y por qué virtualizar 📦
+
+### El problema: "en mi máquina funciona"
+
+El entorno de desarrollo (tu máquina) y el de producción (un servidor remoto) tienen propósitos distintos, y casi nunca son idénticos: distinta versión de sistema operativo, distintas librerías instaladas, distinta configuración. Un binario compilado en un lugar puede fallar o comportarse distinto en otro.
+
+### La solución: virtualización
+
+En vez de mandar solo el código (o el binario) y confiar en que el entorno remoto tenga todo lo necesario, se empaqueta **el entorno completo** — sistema operativo base incluido — junto con la aplicación. Ese paquete (la **imagen**) corre igual en cualquier lado, porque no depende de nada externo a sí mismo.
+
+> ⚠️ Aclaración importante: la imagen **no incluye el sistema operativo de la máquina donde se construye** — trae su propio SO base (por ejemplo, el de `rust:1`), completamente aislado del de tu máquina. Por eso el mismo contenedor corre igual en tu Ubuntu, en el Windows de un compañero, o en un servidor Linux remoto: ninguno de esos entornos le "presta" su sistema operativo al contenedor.
+
+### El Dockerfile: la receta
+
+Es un archivo de texto con instrucciones, organizadas en **capas**: se parte de una imagen base, y se van ejecutando comandos (`COPY`, `RUN`, etc.) uno detrás de otro para construir el entorno final.
+
+```dockerfile
+FROM rust:1          # imagen base, con Rust ya instalado
+WORKDIR /app          # directorio de trabajo dentro de la imagen
+COPY . .              # copiar el código fuente adentro
+ENV SQLX_OFFLINE=true
+RUN cargo build --release   # compilar el binario, DENTRO del contenedor
+ENTRYPOINT ["./target/release/zero2prod"]   # qué ejecutar al arrancar
+```
+
+---
+
+## 2️⃣9️⃣ Docker expone asunciones implícitas del código 🔍
+
+Un aprendizaje central de este capítulo: los problemas que aparecen al dockerizar la aplicación **no son nuevos** — son asunciones que el código ya tenía, pero que en desarrollo local nunca se notaban porque todo (la app, la base de datos, la terminal) compartía el mismo `localhost`.
+
+| Problema encontrado | Asunción implícita que rompió |
+|---|---|
+| `sqlx::query!` falla en el build | Asumía que siempre hay una base de datos accesible en tiempo de compilación |
+| La app se cuelga esperando conectar a Postgres | Asumía que la base de datos siempre está disponible al arrancar |
+| `curl` no puede alcanzar la app | Asumía que "escuchar en `127.0.0.1`" es suficiente para ser alcanzable |
+
+En los tres casos, el código funcionaba perfecto en desarrollo — porque el entorno local disimulaba la asunción. Docker, al aislar todo en redes y sistemas de archivos separados, la vuelve visible.
+
+---
+
+## 3️⃣0️⃣ `SQLX_OFFLINE` en el build de Docker 🗂️
+
+Mismo mecanismo que ya se usa en el pipeline de CI (ver capítulo 4): dentro del contenedor no hay acceso a la base de datos local, así que `sqlx::query!` no puede validarse en tiempo de compilación de la forma habitual. La solución es la misma: usar el caché de metadata de queries (carpeta `.sqlx/`, generada con `cargo sqlx prepare`) en vez de una conexión real, activando `ENV SQLX_OFFLINE=true` en el Dockerfile.
+
+> ✅ Este caché ya estaba resuelto de antes (se generó para el CI) — reutilizarlo acá es la misma solución aplicada a un segundo contexto donde tampoco hay base de datos disponible en build time.
+
+---
+
+## 3️⃣1️⃣ Conexión perezosa: `connect_lazy` y `acquire_timeout` ⏳
+
+### El problema
+
+`PgPoolOptions::connect(...)` intenta conectarse a la base de datos **de inmediato**, de forma bloqueante. Si la base de datos no está disponible en ese momento (como al arrancar un contenedor sin acceso a Postgres), la aplicación **no arranca** — se queda esperando hasta hacer timeout.
+
+### La solución
+
+```rust
+let connection_pool = PgPoolOptions::new()
+    .acquire_timeout(std::time::Duration::from_secs(2))
+    .connect_lazy(configuration.database.connection_string().expose_secret())
+    .expect("Failed to create Postgres connection pool.");
+```
+
+`connect_lazy` arma el pool **sin conectarse todavía** — recién intenta la conexión real la primera vez que alguien ejecuta una query. Esto permite que el servidor arranque igual, aunque la base de datos no esté disponible en ese instante.
+
+### Por qué además configurar un timeout corto
+
+Sin `acquire_timeout` explícito, el default de `sqlx` es un timeout largo (30 segundos). Preferir un timeout corto (2 segundos) es una decisión de diseño: **fallar rápido y de forma visible** es mejor que quedar colgado en silencio — un principio de resiliencia general, no específico de Rust.
+
+---
+
+## 3️⃣2️⃣ Networking: `127.0.0.1` vs. `0.0.0.0` 🌐
+
+### El problema
+
+Que un puerto esté *mapeado* (`docker run -p 8080:8080`) no alcanza si la aplicación, **dentro** del contenedor, sigue escuchando en `127.0.0.1` — esa dirección significa *"aceptar conexiones solo desde dentro de esta misma máquina/contenedor"*. Un request que llega desde afuera del contenedor (aunque pase por el puerto mapeado) no se considera "local" a esa interfaz, y se descarta antes de llegar siquiera a la aplicación.
+
+### La solución
+
+Bindear a `0.0.0.0` (*"aceptar conexiones desde cualquier interfaz de red"*) — pero **solo en producción/contenedores**. En desarrollo local se prefiere seguir usando `127.0.0.1`, para no exponer el servidor de desarrollo a toda la red local sin querer.
+
+### Cómo se logra sin duplicar código: configuración jerárquica
+
+```
+configuration/
+├── base.yaml          # valores compartidos entre todos los entornos
+├── local.yaml          # host: 127.0.0.1
+└── production.yaml     # host: 0.0.0.0
+```
+
+Una variable de entorno (`APP_ENVIRONMENT`) determina cuál archivo específico de entorno se combina con el `base.yaml`. El Dockerfile fija `ENV APP_ENVIRONMENT=production`; en desarrollo local, al no estar seteada, se usa `local` por defecto.
+
+> ✅ Este patrón (config base + overrides por entorno + variable que decide cuál cargar) es universal — se repite en prácticamente cualquier stack tecnológico, no es particular de Rust ni de este proyecto.
+
+---
+
 ## ✅ Resumen ejecutivo
 
 | Concepto | Rol |
@@ -837,9 +948,15 @@ Nada de la generación de logs se reescribe. Lo único que cambiaría es el **de
 | **`LazyLock`** | Garantiza que la inicialización del subscriber ocurra una sola vez, sin importar cuántos tests la invoquen |
 | **`request_id` vía `TracingLogger`** | Identificador único por request HTTP, heredado por todos los spans/logs internos — permite correlacionar toda la historia de un request puntual |
 | **Telemetría dev/test = telemetría en producción** | Los mismos crates y macros instrumentados en desarrollo son los que corren en producción; solo cambia el destino final de los logs |
+| **Docker / virtualización** | Empaqueta app + runtime + SO base propio en una imagen reproducible, aislada del entorno donde se construye o ejecuta |
+| **Docker expone asunciones implícitas** | Problemas que "no existían" en local (DB no accesible en build, conexión bloqueante, `127.0.0.1`) eran asunciones que el entorno local disimulaba, no bugs nuevos |
+| **`SQLX_OFFLINE` + `.sqlx/`** | Permite compilar sin conexión real a la base de datos, tanto en CI como en el build de Docker |
+| **`connect_lazy` + `acquire_timeout`** | La app arranca sin bloquear esperando la DB; al fallar, falla rápido y de forma visible en vez de colgarse en silencio |
+| **`127.0.0.1` vs `0.0.0.0`** | Escuchar solo en la interfaz local (desarrollo) vs. aceptar conexiones desde cualquier interfaz (contenedores/producción) |
+| **Configuración jerárquica por entorno** | Un archivo base + overrides específicos por entorno + una variable que decide cuál cargar — patrón universal, no específico de Rust |
 
 ---
 
 ## 📖 Fuente
 
-Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 (Sign Up A New Subscriber) y 4 (Telemetry) completos, contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9), `config`, `uuid`, `chrono`, `tracing` y `secrecy` (0.10, con `SecretBox`/`SecretString` reemplazando al `Secret<T>` del libro original).
+Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 (Sign Up A New Subscriber), 4 (Telemetry) y 5 (Going Live, primera mitad: Dockerfile básico, `sqlx` offline, conexión perezosa, networking y configuración jerárquica), contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9, con `acquire_timeout` reemplazando al `connect_timeout` del libro), `config`, `uuid`, `chrono`, `tracing` y `secrecy` (0.10, con `SecretBox`/`SecretString` reemplazando al `Secret<T>` del libro original).

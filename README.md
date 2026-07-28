@@ -74,25 +74,29 @@ zero2prod/
 │   ├── lib.rs              ← declara los módulos públicos de la librería
 │   ├── main.rs              ← entrypoint mínimo: lee config, arma TcpListener + PgPool, arranca el server
 │   ├── startup.rs           ← arma App/HttpServer, registra rutas, middlewares y estado compartido (PgPool)
-│   ├── configuration.rs     ← lee configuration.yaml y expone los Settings tipados
+│   ├── configuration.rs     ← lee configuration/*.yaml y expone los Settings tipados
 │   ├── telemetry.rs         ← configura y activa el stack de logging estructurado (tracing)
 │   └── routes/
 │       ├── mod.rs           ← re-exporta los handlers de cada archivo de ruta
 │       ├── health_check.rs  ← handler GET /health_check
 │       └── subscriptions.rs ← handler POST /subscriptions
 ├── migrations/               ← migraciones SQL versionadas (generadas con sqlx-cli)
-├── .sqlx/                    ← caché de metadata de queries, para compilar sin conexión a la DB (CI)
+├── .sqlx/                    ← caché de metadata de queries, para compilar sin conexión a la DB (CI y Docker)
 ├── scripts/
 │   └── init_db.sh            ← levanta Postgres en Docker y corre las migraciones
 ├── tests/
 │   └── health_check.rs       ← tests de integración, le pegan a la API por HTTP real
-├── configuration.yaml        ← configuración de la app (puerto, datos de conexión a la DB)
-└── .env                      ← DATABASE_URL, usado por sqlx en tiempo de compilación
+├── configuration/            ← configuración jerárquica por entorno
+│   ├── base.yaml              ← valores compartidos (puerto default, datos de conexión a la DB)
+│   ├── local.yaml              ← overrides para desarrollo local (host: 127.0.0.1)
+│   └── production.yaml         ← overrides para producción/contenedores (host: 0.0.0.0)
+├── Dockerfile                 ← receta para empaquetar la app como imagen de contenedor
+└── .env                       ← DATABASE_URL, usado por sqlx en tiempo de compilación
 ```
 
 ¿Por qué separado así? Porque un binario (`main.rs`) no se puede importar como dependencia desde otro archivo. Al mover la lógica a `lib.rs` y sus módulos, los tests en `tests/` pueden hacer `use zero2prod::startup::run` y levantar el servidor real para probarlo end-to-end, tal como lo haría un cliente HTTP externo.
 
-📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`, HTML forms, migraciones, `Application State`, workers de Actix, `PgPool` vs `PgConnection`, spans y subscribers de `tracing`), ver [`marcoteorico.md`](./marcoteorico.md).
+📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`, HTML forms, migraciones, `Application State`, workers de Actix, `PgPool` vs `PgConnection`, spans y subscribers de `tracing`, Docker y configuración jerárquica), ver [`marcoteorico.md`](./marcoteorico.md).
 
 ---
 
@@ -204,6 +208,34 @@ PGPASSWORD=password psql -h localhost -U postgres -p 5432 -d newsletter -c '\dt'
 
 ---
 
+## 🐳 Corriendo la app con Docker
+
+La aplicación se puede empaquetar como imagen de contenedor, lista para desplegar en cualquier entorno.
+
+### Construir la imagen
+
+```bash
+docker build --tag zero2prod --file Dockerfile .
+```
+
+### Correrla
+
+```bash
+docker run -p 8080:8080 zero2prod
+```
+
+Esto arranca la app dentro del contenedor, en modo `production` (`APP_ENVIRONMENT=production`, seteado en el propio `Dockerfile`), escuchando en `0.0.0.0:8080` y con el puerto mapeado a tu máquina.
+
+```bash
+curl -v http://127.0.0.1:8080/health_check
+```
+
+> ⚠️ **Limitación actual**: `POST /subscriptions` todavía no funciona dentro del contenedor — la app usa conexión perezosa (`connect_lazy`) a la base de datos, así que arranca sin problema, pero al intentar una query real falla, porque `localhost:5432` dentro del contenedor no ve el Postgres que corre en tu máquina (son redes Docker distintas). Esto se resuelve al desplegar contra una base de datos real y accesible (ver `marcoteorico.md` para el detalle de por qué el libro deja este caso sin resolver en local).
+
+📖 Por qué Docker, cómo interpretar cada línea del `Dockerfile`, y el detalle de `SQLX_OFFLINE`, `connect_lazy`, y la configuración jerárquica por entorno: ver [`marcoteorico.md`](./marcoteorico.md).
+
+---
+
 ## 📦 Dependencias principales de la aplicación
 
 | Crate | Para qué lo usamos |
@@ -211,7 +243,7 @@ PGPASSWORD=password psql -h localhost -U postgres -p 5432 -d newsletter -c '\dt'
 | `actix-web` | Framework web: routing, extractors, servidor HTTP |
 | `serde` (con `derive`) | (De)serialización — convierte el body de los requests (forms) en structs de Rust tipados |
 | `sqlx` (`runtime-tokio`, `tls-rustls-ring-webpki`, `macros`, `postgres`, `uuid`, `chrono`, `migrate`) | Cliente async de PostgreSQL, con validación de queries SQL en tiempo de compilación |
-| `config` | Lee `configuration.yaml` y lo convierte en structs tipados (`Settings`) |
+| `config` | Lee `configuration/base.yaml` + el archivo de entorno correspondiente (`local.yaml`/`production.yaml`, según `APP_ENVIRONMENT`) y los convierte en structs tipados (`Settings`) |
 | `uuid` (feature `v4`) | Genera identificadores únicos (`id` de cada suscriptor) |
 | `chrono` | Maneja timestamps (`subscribed_at`) |
 | `tracing` | Instrumentación: macros y el concepto de `Span` para representar unidades de trabajo |
@@ -283,7 +315,7 @@ cd zero2prod
 cargo watch -x check -x test -x run
 ```
 
-El servidor queda escuchando en `http://127.0.0.1:8080` (puerto leído desde `configuration.yaml`). Podés probar el health check con:
+El servidor queda escuchando en `http://127.0.0.1:8080` (puerto leído desde `configuration/base.yaml`, host desde `configuration/local.yaml`). Podés probar el health check con:
 
 ```bash
 curl -v http://127.0.0.1:8080/health_check
