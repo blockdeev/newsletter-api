@@ -1,5 +1,4 @@
-use secrecy::ExposeSecret;
-use sqlx::{AssertSqlSafe, Connection, PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, PgPool};
 use std::net::TcpListener;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -7,16 +6,10 @@ use zero2prod::configuration::{DatabaseSettings, get_configuration};
 use zero2prod::startup::run;
 use zero2prod::telemetry::{get_subscriber, init_subscriber};
 
-// Aseguramos que el stack de `tracing` se inicialice una sola vez,
-// sin importar cuántos tests corran.
 static TRACING: LazyLock<()> = LazyLock::new(|| {
     let default_filter_level = "info".to_string();
     let subscriber_name = "test".to_string();
 
-    // No podemos asignar el resultado de `get_subscriber` a una variable
-    // según el valor de `TEST_LOG`, porque el sink forma parte del tipo
-    // devuelto por `get_subscriber` (por eso no son el mismo tipo).
-    // Esta es la forma más directa de resolverlo.
     if std::env::var("TEST_LOG").is_ok() {
         let subscriber = get_subscriber(subscriber_name, default_filter_level, std::io::stdout);
         init_subscriber(subscriber);
@@ -32,8 +25,6 @@ pub struct TestApp {
 }
 
 async fn spawn_app() -> TestApp {
-    // La primera vez que se invoca `spawn_app`, se ejecuta el código de `TRACING`.
-    // Las siguientes invocaciones lo van a saltear.
     LazyLock::force(&TRACING);
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
@@ -54,19 +45,18 @@ async fn spawn_app() -> TestApp {
 }
 
 async fn configure_database(config: &DatabaseSettings) -> PgPool {
-    let mut connection =
-        PgConnection::connect(config.connection_string_without_db().expose_secret())
-            .await
-            .expect("Failed to connect to Postgres.");
+    let mut connection = PgConnection::connect_with(&config.without_db())
+        .await
+        .expect("Failed to connect to Postgres.");
 
     let create_db_query = format!(r#"CREATE DATABASE "{}";"#, config.database_name);
 
-    sqlx::query(AssertSqlSafe(create_db_query))
-        .execute(&mut connection)
+    connection
+        .execute(AssertSqlSafe(create_db_query))
         .await
         .expect("Failed to create database.");
 
-    let connection_pool = PgPool::connect(config.connection_string().expose_secret())
+    let connection_pool = PgPool::connect_with(config.with_db())
         .await
         .expect("Failed to connect to Postgres.");
     sqlx::migrate!("./migrations")
