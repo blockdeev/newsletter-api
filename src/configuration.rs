@@ -23,7 +23,6 @@ pub struct DatabaseSettings {
     pub port: u16,
     pub host: String,
     pub database_name: String,
-    // Determina si exigimos que la conexión esté encriptada o no
     pub require_ssl: bool,
 }
 
@@ -32,7 +31,6 @@ impl DatabaseSettings {
         let ssl_mode = if self.require_ssl {
             PgSslMode::Require
         } else {
-            // Intenta una conexión encriptada, y si falla, usa una sin encriptar
             PgSslMode::Prefer
         };
 
@@ -49,7 +47,6 @@ impl DatabaseSettings {
     }
 }
 
-/// Los posibles entornos de ejecución de la aplicación.
 pub enum Environment {
     Local,
     Production,
@@ -95,6 +92,14 @@ pub fn get_configuration() -> Result<Settings, config::ConfigError> {
         .add_source(config::File::from(
             configuration_directory.join(environment_filename),
         ))
+        // Agrega configuración desde variables de entorno con prefijo `APP` y
+        // `__` como separador. Ej: `APP_APPLICATION__PORT=5001` sobreescribe
+        // `Settings.application.port`
+        .add_source(
+            config::Environment::with_prefix("APP")
+                .prefix_separator("_")
+                .separator("__"),
+        )
         .build()?;
 
     settings.try_deserialize::<Settings>()
