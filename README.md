@@ -90,7 +90,8 @@ zero2prod/
 │   ├── base.yaml              ← valores compartidos (puerto default, datos de conexión a la DB)
 │   ├── local.yaml              ← overrides para desarrollo local (host: 127.0.0.1)
 │   └── production.yaml         ← overrides para producción/contenedores (host: 0.0.0.0)
-├── Dockerfile                 ← receta para empaquetar la app como imagen de contenedor
+├── Dockerfile                 ← receta multi-stage (cargo-chef) para empaquetar la app como imagen mínima
+├── spec.yaml                  ← infraestructura como código para el deploy a DigitalOcean App Platform
 └── .env                       ← DATABASE_URL, usado por sqlx en tiempo de compilación
 ```
 
@@ -230,7 +231,7 @@ Esto arranca la app dentro del contenedor, en modo `production` (`APP_ENVIRONMEN
 curl -v http://127.0.0.1:8080/health_check
 ```
 
-> ⚠️ **Limitación actual**: `POST /subscriptions` todavía no funciona dentro del contenedor — la app usa conexión perezosa (`connect_lazy`) a la base de datos, así que arranca sin problema, pero al intentar una query real falla, porque `localhost:5432` dentro del contenedor no ve el Postgres que corre en tu máquina (son redes Docker distintas). Esto se resuelve al desplegar contra una base de datos real y accesible (ver `marcoteorico.md` para el detalle de por qué el libro deja este caso sin resolver en local).
+> ℹ️ **`POST /subscriptions` dentro del contenedor local**: la app usa conexión perezosa (`connect_lazy`) a la base de datos, así que arranca sin problema aunque no haya Postgres accesible. Localmente, `localhost:5432` dentro del contenedor no ve el Postgres que corre en tu máquina host (son redes Docker distintas) — este caso no se resuelve en local, tal como lo deja el propio libro. Sí funciona correctamente contra una base de datos real y accesible por red, como confirmamos en el deploy a producción (ver sección de Deploy más abajo).
 
 📖 Por qué Docker, cómo interpretar cada línea del `Dockerfile`, y el detalle de `SQLX_OFFLINE`, `connect_lazy`, y la configuración jerárquica por entorno: ver [`marcoteorico.md`](./marcoteorico.md).
 
@@ -252,10 +253,13 @@ curl -v http://127.0.0.1:8080/health_check
 | `tracing-log` | Redirige logs de dependencias que usan `log` (como `actix-web`) hacia el mismo pipeline de `tracing` |
 | `tracing-actix-web` | Middleware `TracingLogger`: genera un `request_id` consistente por cada request HTTP |
 | `secrecy` (feature `serde`) | Envuelve el password de la base de datos (`SecretString`) para que no se filtre en logs por accidente |
+| `serde-aux` | Permite que campos numéricos (como `port`) se deserialicen tanto desde YAML (número) como desde variables de entorno (siempre strings) |
 
 📖 El porqué de elegir una base de datos relacional, por qué Postgres puntualmente, y por qué `sqlx` sobre otras alternativas del ecosistema Rust, están explicados en [`marcoteorico.md`](./marcoteorico.md).
 
 ---
+
+## 📦 Dependencias de testing (dev-dependencies)
 
 Estas solo se compilan al correr `cargo test`, no forman parte del binario final:
 
@@ -265,6 +269,81 @@ Estas solo se compilan al correr `cargo test`, no forman parte del binario final
 | `tokio` (features `macros`, `rt-multi-thread`) | Habilita `#[tokio::test]` y `tokio::spawn` para correr el servidor en background durante los tests |
 
 > 💡 Usamos `rustls` en vez del TLS nativo del sistema para evitar depender de OpenSSL/`pkg-config` instalados a nivel del sistema operativo — hace que el proyecto compile igual en cualquier máquina, sin pasos de instalación extra.
+
+---
+
+## 🚀 Deploy a producción (DigitalOcean App Platform)
+
+El proyecto está preparado para desplegarse en DigitalOcean App Platform, usando `spec.yaml` como infraestructura declarada como código.
+
+### Requisitos
+
+- Cuenta de DigitalOcean con método de pago configurado.
+- [`doctl`](https://github.com/digitalocean/doctl) instalado y autenticado (`doctl auth init`).
+- Repo conectado a DigitalOcean (se autoriza la primera vez que creás una app desde la interfaz web).
+
+### Crear la app
+
+```bash
+doctl apps create --spec spec.yaml
+```
+
+### Actualizar la app (tras cambios en `spec.yaml`)
+
+```bash
+doctl apps update <APP_ID> --spec spec.yaml
+```
+
+> ⚠️ `apps update` solo dispara un nuevo build si el contenido de `spec.yaml` cambió. Si el cambio fue solo en el código (sin tocar `spec.yaml`), usá en su lugar:
+> ```bash
+> doctl apps create-deployment <APP_ID>
+> ```
+
+### Ver logs
+
+```bash
+doctl apps logs <APP_ID> --type build --follow   # logs del build
+doctl apps logs <APP_ID> --type run                # logs de la app corriendo
+```
+
+### Variables de entorno y secrets en producción
+
+La base de datos administrada se define dentro del propio `spec.yaml` (sección `databases`). Sus credenciales se inyectan a la app vía variables de entorno con placeholders que DigitalOcean resuelve automáticamente al desplegar — nunca se escribe un password real en el repo:
+
+```yaml
+envs:
+  - key: APP_DATABASE__PASSWORD
+    scope: RUN_TIME
+    type: SECRET
+    value: ${newsletter.PASSWORD}
+```
+
+📖 Cómo `config` mapea `APP_DATABASE__PASSWORD` al campo `Settings.database.password`, y el detalle de `PgConnectOptions`: ver [`marcoteorico.md`](./marcoteorico.md).
+
+### Migraciones contra la base de datos de producción
+
+⚠️ **La conexión directa a una base de datos administrada (puerto no estándar, ej. `25060`) suele estar bloqueada por ISPs/routers residenciales**, incluso con la base de datos abierta a todo tráfico. Si `sqlx migrate run` se cuelga o da timeout desde tu máquina, no asumas que es un problema de credenciales — corré primero un test de conectividad TCP puro:
+
+```bash
+timeout 10 bash -c "echo > /dev/tcp/<HOST>/<PUERTO>" && echo "ABIERTO" || echo "BLOQUEADO"
+```
+
+Si da `BLOQUEADO`, corré las migraciones desde un entorno sin esa restricción — un workflow de GitHub Actions con `workflow_dispatch` (disparo manual, nunca automático) funciona bien para esto, usando un secret del repo (`PRODUCTION_DATABASE_URL`) para la connection string.
+
+📖 El detalle completo de por qué esto pasa (capas de red: firewall local → router/ISP → firewall del proveedor cloud) está en [`marcoteorico.md`](./marcoteorico.md).
+
+### 💰 Costos y limpieza
+
+App Platform y las bases de datos administradas **no tienen tier gratuito**, pero se facturan por segundo/hora de uso real (no una tarifa fija mensual completa). Provisionar, probar, y destruir todo en un mismo día cuesta centavos, no el precio de lista mensual.
+
+**Siempre destruir los recursos después de probar**, para dejar de facturar:
+
+```bash
+doctl apps delete <APP_ID>   # destruye la app Y la base de datos embebida en el mismo spec
+doctl apps list               # confirmar que no queda nada activo
+```
+
+> ⚠️ "Detener"/apagar un recurso no alcanza — factura igual mientras exista. Hay que **destruirlo**.
 
 ---
 

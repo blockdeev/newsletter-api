@@ -920,6 +920,197 @@ Una variable de entorno (`APP_ENVIRONMENT`) determina cuál archivo específico 
 
 ---
 
+## 3️⃣3️⃣ Multi-stage builds: por qué la imagen final no lleva el compilador 🍳
+
+### El problema del Dockerfile de una sola etapa
+
+Un Dockerfile simple (`FROM rust:1` → `COPY . .` → `RUN cargo build --release`) produce una imagen que incluye **todo lo usado para construir la app**: el compilador de Rust completo, el código fuente, y archivos intermedios de compilación — aunque en runtime solo se necesite un único binario ejecutable. Resultado: imágenes de varios gigabytes, cuando el binario en sí puede pesar unos pocos megabytes.
+
+> 💡 Metáfora: es como servir un plato de comida sin retirar las ollas, cuchillos y el desorden de la cocina donde se preparó — el comensal solo necesita el plato terminado.
+
+### La solución: varias etapas, cada una con un propósito
+
+```dockerfile
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef   # base con Rust + cargo-chef
+FROM chef AS planner                                    # analiza dependencias
+FROM chef AS builder                                     # compila dependencias, luego la app
+FROM debian:bookworm-slim AS runtime                     # imagen final, mínima
+COPY --from=builder /app/target/release/zero2prod zero2prod
+```
+
+Cada `FROM` arranca un entorno **nuevo e independiente**. `COPY --from=<stage>` permite traer **solo archivos puntuales** de una etapa anterior hacia la siguiente — en este caso, un único binario ya compilado. La etapa final (`runtime`) nunca tuvo el compilador de Rust instalado; parte de una imagen distinta y mínima (`debian:bookworm-slim`), sin arrastrar nada del proceso de construcción.
+
+### `cargo-chef`: cachear la compilación de dependencias por separado
+
+```dockerfile
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json    # analiza SOLO qué dependencias hacen falta
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json   # compila SOLO las dependencias
+COPY . .                                                    # recién ahora entra el código propio
+RUN cargo build --release --bin zero2prod
+```
+
+Docker cachea capas según si sus **inputs** cambiaron. Al separar "compilar dependencias" (que depende únicamente de `recipe.json`, generado a partir de `Cargo.toml`/`Cargo.lock`) de "compilar el código propio", la capa lenta (compilar ~350 dependencias) queda **cacheada e intacta** mientras no cambien las dependencias — aunque se modifique código de la aplicación en cada build. `builder` arranca desde `chef` (limpio), no desde `planner`, para no arrastrar el código fuente completo antes de necesitarlo, maximizando qué puede quedar cacheado.
+
+### Por qué no hace falta instalar OpenSSL en el runtime
+
+El uso consistente de `rustls` (en vez de TLS nativo del sistema) en todo el proyecto significa que los certificados viajan **embebidos en el propio binario** — la imagen `runtime` final no necesita ningún paquete de sistema relacionado a TLS, a diferencia de un setup con TLS nativo.
+
+---
+
+## 3️⃣4️⃣ De connection strings a `PgConnectOptions`: por qué el tipo de dato importa 🧩
+
+### El problema con un string armado a mano
+
+```rust
+format!("postgres://{}:{}@{}:{}/{}", username, password, host, port, db_name)
+```
+
+Requiere tener **todos los datos disponibles al mismo tiempo, en el mismo lugar**, para poder concatenarlos con el formato correcto. Funciona mientras todos los valores vengan de una sola fuente (como un archivo `.yaml` local) — pero en producción, los datos de conexión llegan **fragmentados**: algunos desde un archivo (host, puerto — no son secretos), y el password específicamente desde una variable de entorno inyectada por el proveedor cloud en el momento del deploy, nunca escrita en el repo.
+
+### La solución: un objeto estructurado, construido pieza por pieza
+
+```rust
+PgConnectOptions::new()
+    .host(&self.host)
+    .username(&self.username)
+    .password(self.password.expose_secret())
+    .port(self.port)
+    .ssl_mode(ssl_mode)
+```
+
+En vez de un string con formato rígido, cada dato de conexión se completa como un campo independiente — permitiendo ensamblar la configuración desde fuentes distintas (archivo + variable de entorno), y agregar opciones adicionales (como el modo SSL) sin arriesgar romper un formato de texto armado a mano.
+
+### `without_db()` vs. `with_db()`
+
+Mismo patrón que ya existía con los strings: una versión de las opciones de conexión **sin** especificar base de datos (necesaria para crear una base de datos que todavía no existe), y otra que agrega el nombre de la base de datos ya elegida:
+
+```rust
+pub fn without_db(&self) -> PgConnectOptions { /* host, user, password, puerto, SSL */ }
+pub fn with_db(&self) -> PgConnectOptions {
+    self.without_db().database(&self.database_name)
+}
+```
+
+### `PgSslMode`: distinta exigencia según el entorno
+
+```rust
+let ssl_mode = if self.require_ssl {
+    PgSslMode::Require   // exige conexión encriptada; falla si no es posible
+} else {
+    PgSslMode::Prefer     // intenta encriptar, pero acepta seguir sin encriptar
+};
+```
+
+En desarrollo local (`require_ssl: false`), Postgres corriendo en Docker en la misma máquina no suele tener certificados configurados, y el tráfico nunca sale de la máquina — exigir SSL rompería el flujo sin aportar seguridad real. En producción (`require_ssl: true`), el tráfico viaja por red real entre el servidor de la app y la base de datos administrada — ahí sí importa que el canal esté encriptado.
+
+---
+
+## 3️⃣5️⃣ Inyección de variables de entorno estructuradas 🔑
+
+### El problema
+
+Para que `config` pueda tomar valores desde variables de entorno del sistema operativo (no solo desde archivos `.yaml`), necesita una fuente adicional explícita en el builder:
+
+```rust
+.add_source(
+    config::Environment::with_prefix("APP")
+        .prefix_separator("_")
+        .separator("__"),
+)
+```
+
+### Cómo se traduce el nombre de una variable a un campo anidado
+
+```
+APP _ DATABASE __ PASSWORD
+    ↑              ↑
+ prefijo       separador entre niveles anidados
+```
+
+`APP_DATABASE__PASSWORD` se mapea automáticamente a `Settings.database.password`. El prefijo (`APP`) evita colisionar con otras variables de entorno del sistema que no tengan nada que ver con la configuración de la aplicación.
+
+### Por qué esta fuente va última en el builder
+
+```rust
+config::Config::builder()
+    .add_source(config::File::from(base.yaml))
+    .add_source(config::File::from(environment.yaml))
+    .add_source(config::Environment::with_prefix("APP")...)  // ← última
+    .build()?
+```
+
+Las fuentes agregadas más tarde tienen **prioridad más alta** — si una variable de entorno existe, sobreescribe lo que digan los archivos `.yaml`. Esto permite que el proveedor cloud inyecte secrets sin necesidad de modificar ningún archivo commiteado al repo.
+
+### El puente entre infraestructura y código: placeholders del proveedor cloud
+
+El `spec.yaml` de DigitalOcean permite referenciar automáticamente las credenciales de una base de datos definida en el mismo spec:
+
+```yaml
+envs:
+  - key: APP_DATABASE__PASSWORD
+    scope: RUN_TIME
+    type: SECRET
+    value: ${newsletter.PASSWORD}
+```
+
+`${newsletter.PASSWORD}` es resuelto por la plataforma en el momento del deploy — nadie necesita ver ni copiar el password real para que llegue correctamente a la variable de entorno `APP_DATABASE__PASSWORD`, que `config` después mapea al struct `Settings`.
+
+---
+
+## 3️⃣6️⃣ Debugging de red en capas: el mismo síntoma, causas distintas 🧅
+
+Un aprendizaje central del deploy real: el mismo síntoma (timeout de conexión) apareció en **tres momentos distintos, con tres causas completamente distintas**. Diagnosticar bien requiere aislar en qué capa está el problema, en vez de asumir la primera explicación.
+
+| Momento | Síntoma | Causa real | Cómo se confirmó |
+|---|---|---|---|
+| 1 | `PoolTimedOut` en el primer request a producción | Timeout de conexión configurado demasiado corto (2s) para latencia de red real | Se resolvió subiendo el timeout — pero **no era la causa final**, solo destapó la siguiente capa |
+| 2 | `relation "subscriptions" does not exist` | Base de datos de producción nunca migrada (solo la local lo estaba) | Mensaje de error explícito, sin ambigüedad |
+| 3 | Timeout al intentar migrar desde la máquina local | El firewall/ISP local bloqueaba el puerto no estándar de la base de datos (`25060`) — nada relacionado a credenciales ni configuración de la app | `ufw status verbose` (sin reglas bloqueando salida) + test de conectividad TCP puro (`/dev/tcp/host/puerto`), aislando el problema de cualquier lógica de Postgres/SSL |
+| 4 | El mismo timeout, esta vez desde GitHub Actions | El firewall del lado de DigitalOcean ("Trusted Sources") solo permitía la app, no runners externos | Confirmado leyendo la documentación oficial del proveedor sobre el alcance de esa configuración |
+
+### La lección general
+
+> ✅ Un timeout de conexión puede originarse en **cualquier punto de la cadena de red**: configuración de la propia app, el sistema operativo local, el router/ISP, o el firewall del proveedor cloud. Verificar con herramientas que aíslen una sola capa a la vez (`ufw`, un test TCP crudo sin librerías de por medio, la documentación del proveedor) evita atacar la causa equivocada repetidamente.
+
+### Por qué un test de conectividad TCP puro es más confiable que reintentar con la herramienta real
+
+```bash
+timeout 10 bash -c "echo > /dev/tcp/<host>/<puerto>" && echo ABIERTO || echo BLOQUEADO
+```
+
+Este comando no sabe nada de Postgres, SSL, ni credenciales — solo intenta abrir un socket TCP crudo. Si esto falla, el problema es de **red pura**, ocurre antes de que cualquier protocolo de aplicación (Postgres, HTTP, lo que sea) entre en juego. Aísla la variable de red de todas las demás variables posibles (credenciales mal escritas, configuración de SSL, etc.).
+
+---
+
+## 3️⃣7️⃣ Por qué un frontend nunca choca con estos problemas de red 🖥️
+
+Los bloqueos de red vistos en el capítulo (firewall local hacia el puerto de la base de datos) son específicos de **conexiones administrativas directas** (`psql`, `sqlx migrate`) desde una máquina personal hacia un puerto no estándar. Un frontend (React o cualquier otro) nunca se conecta directamente a la base de datos — le habla a la API (puerto HTTPS estándar, `443`, que ningún ISP bloquea), y es la propia API la que internamente habla con la base de datos, ya con la conectividad de red resuelta del lado del servidor.
+
+```
+Frontend → (HTTPS, puerto 443) → API Rust → (dentro de la infraestructura del proveedor) → Base de datos
+```
+
+El problema de conectividad restringida solo aparece cuando alguien intenta **saltearse la API** y hablar directo con la base de datos desde fuera de la infraestructura del proveedor cloud.
+
+---
+
+## 3️⃣8️⃣ Costos de infraestructura cloud: facturación por uso, no tarifa fija 💰
+
+Servicios como App Platform y bases de datos administradas de DigitalOcean **no tienen tier gratuito**, pero tampoco cobran una tarifa mensual fija sin importar cuánto se use: la facturación es **por segundo (apps) o por hora (bases de datos)**, con el precio de lista ("$X/mes") representando el máximo si el recurso existe todo el mes.
+
+> ✅ Provisionar, probar, y **destruir** los recursos el mismo día cuesta una fracción del precio de lista — en la práctica, centavos en vez de decenas de dólares.
+
+### La distinción importante: destruir vs. apagar
+
+"Detener"/apagar un recurso (por ejemplo, un droplet apagado pero no eliminado) sigue reservando el espacio, IP, y otros recursos asociados — y sigue facturando. Solo **destruir** (`doctl apps delete`, o el equivalente en el dashboard) detiene la facturación por completo.
+
+---
+
 ## ✅ Resumen ejecutivo
 
 | Concepto | Rol |
@@ -954,9 +1145,14 @@ Una variable de entorno (`APP_ENVIRONMENT`) determina cuál archivo específico 
 | **`connect_lazy` + `acquire_timeout`** | La app arranca sin bloquear esperando la DB; al fallar, falla rápido y de forma visible en vez de colgarse en silencio |
 | **`127.0.0.1` vs `0.0.0.0`** | Escuchar solo en la interfaz local (desarrollo) vs. aceptar conexiones desde cualquier interfaz (contenedores/producción) |
 | **Configuración jerárquica por entorno** | Un archivo base + overrides específicos por entorno + una variable que decide cuál cargar — patrón universal, no específico de Rust |
+| **Multi-stage builds + `cargo-chef`** | Separa "compilar dependencias" (cacheable, cambia poco) de "compilar código propio" (cambia seguido); la imagen final no lleva el compilador, solo el binario |
+| **`PgConnectOptions`** | Configuración de conexión estructurada, ensamblable desde fuentes distintas (archivo + variable de entorno), en vez de un string armado a mano |
+| **`config::Environment` con prefijo** | Permite inyectar secrets vía variables de entorno del sistema, mapeadas automáticamente a campos anidados del struct de configuración |
+| **Debugging de red en capas** | Un mismo síntoma (timeout) puede originarse en distintas capas (app, SO local, ISP/router, firewall del proveedor) — aislar con herramientas que prueben una sola capa por vez evita atacar la causa equivocada |
+| **Facturación cloud por uso** | Apps/bases de datos administradas cobran por segundo/hora de existencia real, no una tarifa fija — destruir (no solo apagar) los recursos detiene el cobro |
 
 ---
 
 ## 📖 Fuente
 
-Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 (Sign Up A New Subscriber), 4 (Telemetry) y 5 (Going Live, primera mitad: Dockerfile básico, `sqlx` offline, conexión perezosa, networking y configuración jerárquica), contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9, con `acquire_timeout` reemplazando al `connect_timeout` del libro), `config`, `uuid`, `chrono`, `tracing` y `secrecy` (0.10, con `SecretBox`/`SecretString` reemplazando al `Secret<T>` del libro original).
+Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 (Sign Up A New Subscriber), 4 (Telemetry) y 5 (Going Live: Dockerfile, `sqlx` offline, conexión perezosa, networking, configuración jerárquica, multi-stage builds, `PgConnectOptions`, y deploy a DigitalOcean App Platform) completos, contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9, con `acquire_timeout` reemplazando al `connect_timeout` del libro), `config`, `uuid`, `chrono`, `tracing`, `secrecy` (0.10, con `SecretBox`/`SecretString`), y al formato actual del App Spec de DigitalOcean (estructura anidada bajo `services:`, PostgreSQL 16).
