@@ -1,4 +1,4 @@
-# zero2prod
+# newsletter-api
 
 Proyecto Rust siguiendo el libro *Zero To Production In Rust*.
 
@@ -69,7 +69,7 @@ Esto corre, en cada guardado: primero `check` (rápido), después `test`, y si t
 Este proyecto está separado en **librería + binario**, un patrón común en proyectos Rust que exponen una API:
 
 ```
-zero2prod/
+newsletter-api/
 ├── src/
 │   ├── lib.rs              ← declara los módulos públicos de la librería
 │   ├── main.rs              ← entrypoint mínimo: lee config, arma TcpListener + PgPool, arranca el server
@@ -95,7 +95,7 @@ zero2prod/
 └── .env                       ← DATABASE_URL, usado por sqlx en tiempo de compilación
 ```
 
-¿Por qué separado así? Porque un binario (`main.rs`) no se puede importar como dependencia desde otro archivo. Al mover la lógica a `lib.rs` y sus módulos, los tests en `tests/` pueden hacer `use zero2prod::startup::run` y levantar el servidor real para probarlo end-to-end, tal como lo haría un cliente HTTP externo.
+¿Por qué separado así? Porque un binario (`main.rs`) no se puede importar como dependencia desde otro archivo. Al mover la lógica a `lib.rs` y sus módulos, los tests en `tests/` pueden hacer `use newsletter_api::startup::run` y levantar el servidor real para probarlo end-to-end, tal como lo haría un cliente HTTP externo.
 
 📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`, HTML forms, migraciones, `Application State`, workers de Actix, `PgPool` vs `PgConnection`, spans y subscribers de `tracing`, Docker y configuración jerárquica), ver [`marcoteorico.md`](./marcoteorico.md).
 
@@ -216,13 +216,13 @@ La aplicación se puede empaquetar como imagen de contenedor, lista para despleg
 ### Construir la imagen
 
 ```bash
-docker build --tag zero2prod --file Dockerfile .
+docker build --tag newsletter-api --file Dockerfile .
 ```
 
 ### Correrla
 
 ```bash
-docker run -p 8080:8080 zero2prod
+docker run -p 8080:8080 newsletter-api
 ```
 
 Esto arranca la app dentro del contenedor, en modo `production` (`APP_ENVIRONMENT=production`, seteado en el propio `Dockerfile`), escuchando en `0.0.0.0:8080` y con el puerto mapeado a tu máquina.
@@ -384,8 +384,8 @@ Corre `cargo-audit` directamente (instalado en el runner) para detectar vulnerab
 ## 🚀 Cómo levantar el proyecto localmente
 
 ```bash
-git clone git@github.com:blockdeev/zero2prod.git
-cd zero2prod
+git clone git@github.com:blockdeev/newsletter-api.git
+cd newsletter-api
 
 # 1. Levantar la base de datos (Docker + migraciones)
 ./scripts/init_db.sh

@@ -307,7 +307,7 @@ Hasta ahora todo el código vivía en `src/main.rs`, compilado como **binario**.
 
 ### El problema
 
-Los tests en la carpeta `tests/` se compilan como **binarios separados**, con exactamente el mismo nivel de acceso que tendría alguien que importa nuestro proyecto como dependencia (`use zero2prod::algo`). Pero **un binario no se puede importar como dependencia** — solo las librerías (`lib`) se pueden importar con `use`. Si toda la lógica vive únicamente en `main.rs`, los tests en `tests/` no tienen a qué apuntar: no existe ningún `zero2prod::algo` al que hacer `use`, porque no hay ninguna librería, solo un ejecutable aislado.
+Los tests en la carpeta `tests/` se compilan como **binarios separados**, con exactamente el mismo nivel de acceso que tendría alguien que importa nuestro proyecto como dependencia (`use newsletter_api::algo`). Pero **un binario no se puede importar como dependencia** — solo las librerías (`lib`) se pueden importar con `use`. Si toda la lógica vive únicamente en `main.rs`, los tests en `tests/` no tienen a qué apuntar: no existe ningún `newsletter_api::algo` al que hacer `use`, porque no hay ninguna librería, solo un ejecutable aislado.
 
 ### La solución: dos crates en el mismo `Cargo.toml`
 
@@ -317,7 +317,7 @@ path = "src/lib.rs"
 
 [[bin]]
 path = "src/main.rs"
-name = "zero2prod"
+name = "newsletter-api"
 ```
 
 ```
@@ -330,7 +330,7 @@ src/
 
 ```rust
 use std::net::TcpListener;
-use zero2prod::run;
+use newsletter_api::run;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -366,7 +366,7 @@ El runtime solo puede intercalar trabajo entre tasks que **ya existen**. Si escr
 
 ```rust
 async fn spawn_app() -> std::io::Result<()> {
-    zero2prod::run().await   // (A) bloquea el avance de ESTA task hasta resolverse
+    newsletter_api::run().await   // (A) bloquea el avance de ESTA task hasta resolverse
 }
 
 async fn health_check_works() {
@@ -381,7 +381,7 @@ async fn health_check_works() {
 
 ```rust
 fn spawn_app() {
-    let server = zero2prod::run().expect("Failed to bind address");
+    let server = newsletter_api::run().expect("Failed to bind address");
     let _ = tokio::spawn(server);   // ← crea una NUEVA task, independiente
 }
 ```
@@ -845,7 +845,7 @@ WORKDIR /app          # directorio de trabajo dentro de la imagen
 COPY . .              # copiar el código fuente adentro
 ENV SQLX_OFFLINE=true
 RUN cargo build --release   # compilar el binario, DENTRO del contenedor
-ENTRYPOINT ["./target/release/zero2prod"]   # qué ejecutar al arrancar
+ENTRYPOINT ["./target/release/newsletter-api"]   # qué ejecutar al arrancar
 ```
 
 ---
@@ -935,7 +935,7 @@ FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef   # base con Rust + cargo-c
 FROM chef AS planner                                    # analiza dependencias
 FROM chef AS builder                                     # compila dependencias, luego la app
 FROM debian:bookworm-slim AS runtime                     # imagen final, mínima
-COPY --from=builder /app/target/release/zero2prod zero2prod
+COPY --from=builder /app/target/release/newsletter-api newsletter-api
 ```
 
 Cada `FROM` arranca un entorno **nuevo e independiente**. `COPY --from=<stage>` permite traer **solo archivos puntuales** de una etapa anterior hacia la siguiente — en este caso, un único binario ya compilado. La etapa final (`runtime`) nunca tuvo el compilador de Rust instalado; parte de una imagen distinta y mínima (`debian:bookworm-slim`), sin arrastrar nada del proceso de construcción.
@@ -951,7 +951,7 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json   # compila SOLO las dependencias
 COPY . .                                                    # recién ahora entra el código propio
-RUN cargo build --release --bin zero2prod
+RUN cargo build --release --bin newsletter-api
 ```
 
 Docker cachea capas según si sus **inputs** cambiaron. Al separar "compilar dependencias" (que depende únicamente de `recipe.json`, generado a partir de `Cargo.toml`/`Cargo.lock`) de "compilar el código propio", la capa lenta (compilar ~350 dependencias) queda **cacheada e intacta** mientras no cambien las dependencias — aunque se modifique código de la aplicación en cada build. `builder` arranca desde `chef` (limpio), no desde `planner`, para no arrastrar el código fuente completo antes de necesitarlo, maximizando qué puede quedar cacheado.
